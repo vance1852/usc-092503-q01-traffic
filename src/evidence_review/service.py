@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import sqlite3
 from datetime import timedelta
 from decimal import Decimal
@@ -21,10 +23,31 @@ ROLE_PERMISSIONS = {
         "catalog.write", "batch.create", "batch.start", "evidence_item.import",
         "exclusion.request", "exclusion.revoke",
     },
-    "statistician": {"evidence_protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
+    "statistician": {
+        "evidence_protocol.publish", "batch.seal", "exclusion.review", "analysis.run",
+        "worker.register",
+    },
     "approver": {"decision.write"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "worker.revoke", "user.deactivate"},
 }
+
+
+class _LeaseRejected(Exception):
+    """事务内最终守卫失败：需要回滚业务写入、单独持久化拒绝审计。"""
+
+    FORBIDDEN_REASONS = frozenset({"worker_revoked", "owner_deactivated"})
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.error: type[Forbidden] | type[InvalidState] = (
+            Forbidden if reason in self.FORBIDDEN_REASONS else InvalidState
+        )
+        self.message = (
+            "工作进程已撤销或登记账号已停用"
+            if reason in self.FORBIDDEN_REASONS
+            else "任务租约已过期或所有权已变化"
+        )
 
 
 class EvidenceReviewService:
@@ -77,6 +100,109 @@ class EvidenceReviewService:
         except sqlite3.IntegrityError as exc:
             raise Conflict(f"用户已存在: {user_id}") from exc
         return {"user_id": user_id.strip(), "role": role}
+
+    def deactivate_user(self, actor_id: str, user_id: str, reason: str) -> dict[str, Any]:
+        self._require(actor_id, "user.deactivate")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE users SET active=0 WHERE user_id=? AND active=1", (user_id,)
+            )
+            if cursor.rowcount != 1:
+                row = self.connection.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone()
+                raise InvalidState("用户不存在或已停用") if row else NotFound(f"用户不存在: {user_id}")
+            self._audit("user", user_id, "user.deactivated", actor_id, {"reason": reason})
+        return {"user_id": user_id, "active": False}
+
+    @staticmethod
+    def _credential_hash(credential: str) -> str:
+        return hashlib.sha256(credential.encode("utf-8")).hexdigest()
+
+    def register_worker(
+        self, actor_id: str, worker_id: str, display_name: str, credential: str | None = None
+    ) -> dict[str, Any]:
+        """登记一个可领取任务的工作进程，返回该进程的调用凭证（仅在登记时出现一次）。"""
+
+        self._require(actor_id, "worker.register")
+        if not worker_id.strip() or not display_name.strip():
+            raise ValidationFailed("工作进程编号和名称不能为空")
+        credential = credential or secrets.token_urlsafe(32)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO workers(worker_id,display_name,credential_hash,registered_by,registered_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        worker_id.strip(),
+                        display_name.strip(),
+                        self._credential_hash(credential),
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit("worker", worker_id.strip(), "worker.registered", actor_id, {"display_name": display_name})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict(f"工作进程已存在: {worker_id}") from exc
+        return {"worker_id": worker_id.strip(), "credential": credential}
+
+    def revoke_worker(self, actor_id: str, worker_id: str, reason: str) -> dict[str, Any]:
+        self._require(actor_id, "worker.revoke")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE workers SET revoked_at=?,revoke_reason=?,revoked_by=? "
+                "WHERE worker_id=? AND revoked_at IS NULL",
+                (self._now(), reason, actor_id, worker_id),
+            )
+            if cursor.rowcount != 1:
+                row = self.connection.execute("SELECT 1 FROM workers WHERE worker_id=?", (worker_id,)).fetchone()
+                raise InvalidState("工作进程已撤销") if row else NotFound(f"工作进程不存在: {worker_id}")
+            self._audit("worker", worker_id, "worker.revoked", actor_id, {"reason": reason})
+        return {"worker_id": worker_id, "revoked": True}
+
+    def _authenticate_worker(self, worker_id: str, credential: str) -> sqlite3.Row:
+        """校验工作进程凭证，同时拒绝已撤销进程及其停用登记人。"""
+
+        worker = self.connection.execute(
+            "SELECT w.worker_id,w.credential_hash,w.revoked_at,u.active AS owner_active "
+            "FROM workers w JOIN users u ON u.user_id=w.registered_by WHERE w.worker_id=?",
+            (worker_id,),
+        ).fetchone()
+        if worker is None:
+            raise NotFound(f"工作进程未登记: {worker_id}")
+        if not secrets.compare_digest(worker["credential_hash"], self._credential_hash(credential)):
+            raise Forbidden("工作进程凭证无效")
+        if worker["revoked_at"] is not None:
+            raise Forbidden("工作进程已被撤销")
+        if not worker["owner_active"]:
+            raise Forbidden("登记该工作进程的账号已停用")
+        return worker
+
+    def _lease_event(
+        self, job_id: int, action: str, worker_id: str | None, actor_id: str | None, reason: str
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO job_lease_events(job_id,action,worker_id,actor_id,reason,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (job_id, action, worker_id, actor_id, reason, self._now()),
+        )
+
+    def _record_rejection(self, job_id: int, worker_id: str, actor_id: str, reason: str) -> None:
+        """在主事务回滚后单独落一条拒绝审计，保证拒绝原因可追溯。"""
+
+        with transaction(self.connection, immediate=True):
+            self._lease_event(job_id, "rejected", worker_id, actor_id, reason)
+
+    def _guard_worker_active_in_tx(self, worker_id: str) -> None:
+        """写事务内复查进程与登记账号状态，兜底长任务执行期间的撤销/停用。"""
+
+        row = self.connection.execute(
+            "SELECT w.revoked_at,u.active FROM workers w JOIN users u ON u.user_id=w.registered_by "
+            "WHERE w.worker_id=?",
+            (worker_id,),
+        ).fetchone()
+        if row is None or row["revoked_at"] is not None:
+            raise _LeaseRejected("worker_revoked")
+        if not row["active"]:
+            raise _LeaseRejected("owner_deactivated")
 
     def register_device(
         self, actor_id: str, device_id: str, model_name: str, vendor: str
@@ -362,27 +488,103 @@ class EvidenceReviewService:
             self._audit("batch", batch_id, "batch.sealed", actor_id, {"revision": new_revision})
         return self.get_batch(batch_id)
 
-    def claim_job(self, worker_id: str, lease_seconds: int = 60) -> dict[str, Any] | None:
+    def claim_job(self, actor_id: str, worker_id: str, credential: str, lease_seconds: int = 60) -> dict[str, Any] | None:
+        """领取一个可处理任务；调用者必须持有已登记工作进程的凭证。
+
+        重复领取同一任务返回当前租约；租约过期后由新进程确定接管；
+        尝试次数与所有权变化持久化，并写入租约事件供审计。
+        """
+
+        self._require(actor_id, "analysis.run")
+        self._authenticate_worker(worker_id, credential)
         if lease_seconds <= 0:
             raise ValidationFailed("租约时长必须大于零")
         now = self._now()
         expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
         with transaction(self.connection, immediate=True):
+            # 事务内复查进程状态，兜底认证与领取之间的撤销/停用竞态。
+            authority = self.connection.execute(
+                "SELECT w.revoked_at,u.active FROM workers w JOIN users u ON u.user_id=w.registered_by "
+                "WHERE w.worker_id=?",
+                (worker_id,),
+            ).fetchone()
+            if authority is None or authority["revoked_at"] is not None or not authority["active"]:
+                raise Forbidden("工作进程已撤销或登记账号已停用")
+            # 同一工作进程重复领取：幂等返回其仍持有的租约，不增加尝试次数。
+            mine = self.connection.execute(
+                "SELECT job_id FROM analysis_jobs "
+                "WHERE state='leased' AND lease_owner=? AND lease_expires_at>?",
+                (worker_id, now),
+            ).fetchone()
+            if mine is not None:
+                self._lease_event(mine["job_id"], "rejected", worker_id, actor_id, "duplicate_claim_active_lease")
+                claimed = self.connection.execute(
+                    "SELECT * FROM analysis_jobs WHERE job_id=?", (mine["job_id"],)
+                ).fetchone()
+                return dict(claimed)
+
             row = self.connection.execute(
-                "SELECT job_id FROM analysis_jobs WHERE "
+                "SELECT job_id,lease_owner,lease_expires_at FROM analysis_jobs WHERE "
                 "(state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?) "
                 "ORDER BY available_at,job_id LIMIT 1",
                 (now, now),
             ).fetchone()
             if row is None:
                 return None
+            previous_owner = row["lease_owner"]
+            reacquired = row["lease_expires_at"] is not None
+            fingerprint = secrets.token_hex(16)
             self.connection.execute(
-                "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_expires_at=?,updated_at=? "
-                "WHERE job_id=?",
-                (worker_id, expires, now, row["job_id"]),
+                "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_actor=?,"
+                "lease_fingerprint=?,lease_expires_at=?,last_error=NULL,updated_at=? WHERE job_id=?",
+                (worker_id, actor_id, fingerprint, expires, now, row["job_id"]),
+            )
+            self._lease_event(
+                row["job_id"],
+                "reacquired" if reacquired else "acquired",
+                worker_id,
+                actor_id,
+                f"lease_expired_owner={previous_owner}" if reacquired else "queued_claim",
             )
             claimed = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (row["job_id"],)).fetchone()
         return dict(claimed)
+
+    def renew_job(self, actor_id: str, worker_id: str, credential: str, job_id: int, lease_seconds: int = 60) -> dict[str, Any]:
+        """由当前租约持有者续租；过期或已被接管时明确拒绝。"""
+
+        self._require(actor_id, "analysis.run")
+        self._authenticate_worker(worker_id, credential)
+        if lease_seconds <= 0:
+            raise ValidationFailed("租约时长必须大于零")
+        now = self._now()
+        expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
+        job = self.connection.execute(
+            "SELECT state,lease_owner,lease_expires_at FROM analysis_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if job is None:
+            raise NotFound("分析任务不存在")
+        if job["state"] != "leased" or job["lease_owner"] != worker_id:
+            self._record_rejection(job_id, worker_id, actor_id, "renew_not_lease_owner")
+            raise InvalidState("任务未由当前工作进程持有")
+        if job["lease_expires_at"] <= now:
+            self._record_rejection(job_id, worker_id, actor_id, "renew_after_expiry")
+            raise InvalidState("任务租约已经过期")
+        try:
+            with transaction(self.connection, immediate=True):
+                self._guard_worker_active_in_tx(worker_id)
+                cursor = self.connection.execute(
+                    "UPDATE analysis_jobs SET lease_expires_at=?,updated_at=? "
+                    "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_expires_at>?",
+                    (expires, now, job_id, worker_id, now),
+                )
+                if cursor.rowcount != 1:
+                    raise _LeaseRejected("renew_lease_changed")
+                self._lease_event(job_id, "renewed", worker_id, actor_id, "heartbeat")
+                renewed = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
+        except _LeaseRejected as rejected:
+            self._record_rejection(job_id, worker_id, actor_id, rejected.reason)
+            raise rejected.error(rejected.message) from rejected
+        return dict(renewed)
 
     def _analysis_evidence_items(self, batch_id: str, evidence_protocol: EvidenceProtocol) -> tuple[EvidenceItem, ...]:
         rows = self.connection.execute(
@@ -407,14 +609,25 @@ class EvidenceReviewService:
             ))
         return tuple(items)
 
-    def complete_job(self, worker_id: str, job_id: int, statistician_id: str) -> dict[str, Any]:
-        self._require(statistician_id, "analysis.run")
+    def complete_job(
+        self, actor_id: str, worker_id: str, credential: str, job_id: int, fingerprint: str
+    ) -> dict[str, Any]:
+        """由租约持有者提交结果；指纹防止旧持有者在被接管后迟到提交。"""
+
+        self._require(actor_id, "analysis.run")
+        self._authenticate_worker(worker_id, credential)
         job = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
         if job is None:
             raise NotFound("分析任务不存在")
+        now = self._now()
         if job["state"] != "leased" or job["lease_owner"] != worker_id:
+            self._record_rejection(job_id, worker_id, actor_id, "complete_not_lease_owner")
             raise InvalidState("任务未由当前工作进程持有")
-        if job["lease_expires_at"] <= self._now():
+        if job["lease_fingerprint"] != fingerprint:
+            self._record_rejection(job_id, worker_id, actor_id, "complete_stale_fingerprint")
+            raise InvalidState("租约指纹与当前租约不一致")
+        if job["lease_expires_at"] <= now:
+            self._record_rejection(job_id, worker_id, actor_id, "complete_after_expiry")
             raise InvalidState("任务租约已经过期")
         batch = self.get_batch(job["batch_id"])
         evidence_protocol, evidence_protocol_digest = self._evidence_protocol(batch["evidence_protocol_id"], batch["evidence_protocol_version"])
@@ -431,53 +644,105 @@ class EvidenceReviewService:
         ]
         input_digest = content_digest(snapshot_rows)
         result = analyze(evidence_protocol, evidence_items)
-        with transaction(self.connection, immediate=True):
-            existing = self.connection.execute(
-                "SELECT analysis_id,result_json FROM analyses WHERE batch_id=? AND batch_revision=? AND input_sha256=?",
-                (batch["batch_id"], job["batch_revision"], input_digest),
-            ).fetchone()
-            if existing is None:
+        committed_at = self._now()
+        try:
+            with transaction(self.connection, immediate=True):
+                self._guard_worker_active_in_tx(worker_id)
+                existing = self.connection.execute(
+                    "SELECT analysis_id,result_json FROM analyses WHERE batch_id=? AND batch_revision=? AND input_sha256=?",
+                    (batch["batch_id"], job["batch_revision"], input_digest),
+                ).fetchone()
+                if existing is None:
+                    cursor = self.connection.execute(
+                        "INSERT INTO analyses(batch_id,batch_revision,evidence_protocol_sha256,input_sha256,algorithm_version,seed,"
+                        "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (
+                            batch["batch_id"], job["batch_revision"], evidence_protocol_digest, input_digest,
+                            ALGORITHM_VERSION, evidence_protocol.seed, canonical_json(result), actor_id, self._now(),
+                        ),
+                    )
+                    analysis_id = cursor.lastrowid
+                else:
+                    analysis_id = existing["analysis_id"]
+                    result = json.loads(existing["result_json"])
+                # 事务内最终判定：指纹与到期时间双重守卫，杜绝接管竞态下的迟到提交。
                 cursor = self.connection.execute(
-                    "INSERT INTO analyses(batch_id,batch_revision,evidence_protocol_sha256,input_sha256,algorithm_version,seed," 
-                    "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (
-                        batch["batch_id"], job["batch_revision"], evidence_protocol_digest, input_digest,
-                        ALGORITHM_VERSION, evidence_protocol.seed, canonical_json(result), statistician_id, self._now(),
-                    ),
+                    "UPDATE analysis_jobs SET state='succeeded',lease_owner=NULL,lease_actor=NULL,lease_fingerprint=NULL,"
+                    "lease_expires_at=NULL,updated_at=? "
+                    "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_fingerprint=? AND lease_expires_at>?",
+                    (committed_at, job_id, worker_id, fingerprint, committed_at),
                 )
-                analysis_id = cursor.lastrowid
-            else:
-                analysis_id = existing["analysis_id"]
-                result = json.loads(existing["result_json"])
-            self.connection.execute(
-                "UPDATE analysis_jobs SET state='succeeded',lease_owner=NULL,lease_expires_at=NULL,updated_at=? "
-                "WHERE job_id=? AND state='leased' AND lease_owner=?",
-                (self._now(), job_id, worker_id),
-            )
-            self.connection.execute(
-                "UPDATE batches SET state='analyzed' WHERE batch_id=? AND state IN ('sealed','analyzing')",
-                (batch["batch_id"],),
-            )
-            self._audit(
-                "batch",
-                batch["batch_id"],
-                "analysis.completed",
-                statistician_id,
-                {"analysis_id": analysis_id, "input_sha256": input_digest},
-            )
+                if cursor.rowcount != 1:
+                    raise _LeaseRejected("complete_lease_expired_or_changed")
+                self.connection.execute(
+                    "UPDATE batches SET state='analyzed' WHERE batch_id=? AND state IN ('sealed','analyzing')",
+                    (batch["batch_id"],),
+                )
+                self._lease_event(job_id, "completed", worker_id, actor_id, "analysis_succeeded")
+                self._audit(
+                    "batch",
+                    batch["batch_id"],
+                    "analysis.completed",
+                    actor_id,
+                    {"analysis_id": analysis_id, "input_sha256": input_digest, "worker_id": worker_id},
+                )
+        except _LeaseRejected as rejected:
+            self._record_rejection(job_id, worker_id, actor_id, rejected.reason)
+            raise rejected.error(rejected.message) from rejected
         return {"analysis_id": analysis_id, "input_sha256": input_digest, "result": result}
 
-    def fail_job(self, worker_id: str, job_id: int, error: str, retry_seconds: int = 0) -> dict[str, Any]:
+    def fail_job(
+        self, actor_id: str, worker_id: str, credential: str, job_id: int, fingerprint: str,
+        error: str, retry_seconds: int = 0,
+    ) -> dict[str, Any]:
+        """由租约持有者报告失败并归还队列；迟到或越权提交明确拒绝。"""
+
+        self._require(actor_id, "analysis.run")
+        self._authenticate_worker(worker_id, credential)
+        now = self._now()
         available = isoformat(self.clock.now() + timedelta(seconds=retry_seconds))
-        with transaction(self.connection, immediate=True):
-            cursor = self.connection.execute(
-                "UPDATE analysis_jobs SET state='queued',available_at=?,lease_owner=NULL,lease_expires_at=NULL," 
-                "last_error=?,updated_at=? WHERE job_id=? AND state='leased' AND lease_owner=?",
-                (available, error[:1000], self._now(), job_id, worker_id),
-            )
-            if cursor.rowcount != 1:
-                raise InvalidState("任务未由当前工作进程持有")
+        job = self.connection.execute(
+            "SELECT state,lease_owner,lease_fingerprint,lease_expires_at FROM analysis_jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        if job is None:
+            raise NotFound("分析任务不存在")
+        if job["state"] != "leased" or job["lease_owner"] != worker_id:
+            self._record_rejection(job_id, worker_id, actor_id, "fail_not_lease_owner")
+            raise InvalidState("任务未由当前工作进程持有")
+        if job["lease_fingerprint"] != fingerprint:
+            self._record_rejection(job_id, worker_id, actor_id, "fail_stale_fingerprint")
+            raise InvalidState("租约指纹与当前租约不一致")
+        if job["lease_expires_at"] <= now:
+            self._record_rejection(job_id, worker_id, actor_id, "fail_after_expiry")
+            raise InvalidState("任务租约已经过期")
+        try:
+            with transaction(self.connection, immediate=True):
+                self._guard_worker_active_in_tx(worker_id)
+                cursor = self.connection.execute(
+                    "UPDATE analysis_jobs SET state='queued',available_at=?,lease_owner=NULL,lease_actor=NULL,"
+                    "lease_fingerprint=NULL,lease_expires_at=NULL,last_error=?,updated_at=? "
+                    "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_fingerprint=? AND lease_expires_at>?",
+                    (available, error[:1000], now, job_id, worker_id, fingerprint, now),
+                )
+                if cursor.rowcount != 1:
+                    raise _LeaseRejected("fail_lease_expired_or_changed")
+                self._lease_event(job_id, "failed", worker_id, actor_id, error[:200])
+        except _LeaseRejected as rejected:
+            self._record_rejection(job_id, worker_id, actor_id, rejected.reason)
+            raise rejected.error(rejected.message) from rejected
         return {"job_id": job_id, "state": "queued", "available_at": available}
+
+    def job_lease_events(self, actor_id: str, job_id: int) -> list[dict[str, Any]]:
+        """审计查询：某任务每次占用、续租、释放与拒绝的原因。"""
+
+        self._require(actor_id, "audit.read")
+        rows = self.connection.execute(
+            "SELECT event_id,job_id,action,worker_id,actor_id,reason,created_at "
+            "FROM job_lease_events WHERE job_id=? ORDER BY event_id",
+            (job_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def decide(
         self, actor_id: str, batch_id: str, analysis_id: int, decision: str, reason: str
