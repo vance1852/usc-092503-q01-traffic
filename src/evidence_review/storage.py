@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -108,6 +108,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_open_exclusion_per_evidence_item
 ON exclusion_requests(evidence_item_id)
 WHERE status IN ('pending', 'approved');
 
+CREATE TABLE IF NOT EXISTS worker_processes (
+    worker_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL REFERENCES users(user_id),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    revoked_by TEXT REFERENCES users(user_id),
+    revoked_at TEXT,
+    revoke_reason TEXT
+);
+
 CREATE TABLE IF NOT EXISTS analysis_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
@@ -116,6 +128,7 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT,
+    lease_actor TEXT REFERENCES users(user_id),
     lease_expires_at TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
@@ -161,7 +174,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "evidence_protocol_catalog", "users", "capture_devices", "builds", "batches",
-    "evidence_items", "idempotency_keys", "exclusion_requests", "analysis_jobs",
+    "evidence_items", "idempotency_keys", "exclusion_requests", "worker_processes", "analysis_jobs",
     "analyses", "decisions", "audit_events",
 })
 
@@ -190,10 +203,21 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate(connection: sqlite3.Connection) -> None:
+    """为既有数据库补充新增列，保证重启后租约状态连续。"""
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(analysis_jobs)")}
+    if "lease_actor" not in columns:
+        connection.execute(
+            "ALTER TABLE analysis_jobs ADD COLUMN lease_actor TEXT REFERENCES users(user_id)"
+        )
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    _migrate(connection)
     with transaction(connection, immediate=True):
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "

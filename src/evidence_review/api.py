@@ -114,19 +114,46 @@ class JsonApplication:
                     self._actor(normalized_headers), int(parts[1]), payload["reason"]
                 )
                 return Response(200, result)
+            if method == "POST" and path == "/workers":
+                result = self.service.register_worker(
+                    self._actor(normalized_headers), payload["worker_id"], payload["display_name"],
+                    payload["owner_user_id"],
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "workers" and parts[2] == "revoke":
+                result = self.service.revoke_worker(self._actor(normalized_headers), parts[1], payload["reason"])
+                return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "workers" and parts[2] == "events":
+                events = self.service.list_job_events(self._actor(normalized_headers), worker_id=parts[1])
+                return Response(200, {"events": events})
             if method == "POST" and path == "/jobs/claim":
-                result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
+                result = self.service.claim_job(
+                    self._actor(normalized_headers), payload["worker_id"], int(payload.get("lease_seconds", 60))
+                )
                 return Response(200, {"job": result})
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "renew":
+                result = self.service.renew_job(
+                    self._actor(normalized_headers), payload["worker_id"], int(parts[1]),
+                    int(payload.get("lease_seconds", 60)),
+                )
+                return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
                 result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
+                    self._actor(normalized_headers), payload["worker_id"], int(parts[1])
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
-                    payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
+                    self._actor(normalized_headers), payload["worker_id"], int(parts[1]),
+                    payload["error"], int(payload.get("retry_seconds", 0)),
                 )
                 return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "events":
+                events = self.service.list_job_events(self._actor(normalized_headers), job_id=int(parts[1]))
+                return Response(200, {"events": events})
+            if method == "GET" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "job_events":
+                events = self.service.list_job_events(self._actor(normalized_headers), batch_id=parts[1])
+                return Response(200, {"events": events})
             if method == "POST" and path == "/decisions":
                 result = self.service.decide(
                     self._actor(normalized_headers), payload["batch_id"], int(payload["analysis_id"]),
